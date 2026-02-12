@@ -8,7 +8,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 # ==========================================
-# PART 1: AUTOCOUNT BRIDGE
+# PART 1: AUTOCOUNT BRIDGE ( unchanged )
 # ==========================================
 class AutoCountService:
     def __init__(self):
@@ -35,169 +35,170 @@ class AutoCountService:
         if not self.auth_key: self.login()
         return {"Content-Type": "application/json", "Authorization": self.auth_key}
 
-    # --- FUNCTION 1: DEBTOR LIST (Flexible Limit) ---
-    def get_debtors(self, limit=5):
+    def _get_balance(self, item):
+        for key in ['Balance', 'Outstanding', 'CurBalance', 'NetTotal']:
+            if key in item and item[key] is not None: return float(item[key])
+        return 0.0
+
+    def _get_qty(self, item):
+        total_qty = 0.0
+        if 'BalQty' in item: total_qty = float(item['BalQty'])
+        elif 'Qty' in item: total_qty = float(item['Qty'])
+        if "ItemDTL" in item and isinstance(item["ItemDTL"], list):
+            for dtl in item["ItemDTL"]: total_qty += float(dtl.get("BalQty", dtl.get("Qty", 0)))
+        return total_qty
+
+    # --- DEBTOR FUNCTIONS ---
+    def get_debtor_list(self, limit=20):
         url = f"{self.base_url}/api/Debtor/GetDebtor/"
-        payload = {"AccNo": []} 
         try:
-            r = requests.post(url, json=payload, headers=self._get_headers(), timeout=10)
+            r = requests.post(url, json={"AccNo": []}, headers=self._get_headers(), timeout=10)
             if r.status_code == 200:
                 data = r.json()
-                # Sort by Balance (Descending) to show highest debt first
-                # We normalize field names (Balance vs Outstanding)
-                sorted_data = sorted(
-                    data, 
-                    key=lambda x: float(x.get('Balance', x.get('Outstanding', 0.0))), 
-                    reverse=True
-                )
-                return sorted_data[:limit]
-        except Exception as e:
-            print(f"Error fetching debtors: {e}")
-        return None
+                for d in data: d['show_bal'] = self._get_balance(d)
+                return data[:limit]
+        except: return None
 
-    # --- FUNCTION 2: DEBTOR PROFILE (Detailed Lookup) ---
+    def get_debtor_outstanding(self, limit=5):
+        url = f"{self.base_url}/api/Debtor/GetDebtor/"
+        try:
+            r = requests.post(url, json={"AccNo": []}, headers=self._get_headers(), timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                for d in data: d['show_bal'] = self._get_balance(d)
+                debtors = [d for d in data if d['show_bal'] > 0]
+                return sorted(debtors, key=lambda x: x['show_bal'], reverse=True)[:limit]
+        except: return None
+
     def get_debtor_profile(self, keyword):
         url = f"{self.base_url}/api/Debtor/GetDebtor/"
-        payload = {"AccNo": []} # Fetch all to search
         try:
-            r = requests.post(url, json=payload, headers=self._get_headers(), timeout=10)
+            r = requests.post(url, json={"AccNo": []}, headers=self._get_headers(), timeout=10)
             if r.status_code == 200:
                 data = r.json()
                 keyword = keyword.lower()
-                
                 for item in data:
-                    name = item.get("CompanyName", "").lower()
-                    code = item.get("AccNo", "").lower()
-                    
-                    if keyword in name or keyword in code:
-                        return item # Return the specific dictionary
-        except Exception as e:
-            print(f"Error fetching profile: {e}")
-        return None
+                    if keyword in item.get("CompanyName", "").lower() or keyword in item.get("AccNo", "").lower():
+                        item['show_bal'] = self._get_balance(item)
+                        return item
+        except: return None
 
-    # --- FUNCTION 3: SALES DASHBOARD ---
-    def get_sales_dashboard(self, specific_date=None):
+    # --- STOCK FUNCTIONS ---
+    def get_stock_list(self, limit=20):
+        url = f"{self.base_url}/api/V2/Item/GetItem"
+        try:
+            r = requests.post(url, json={"ItemCode": [], "IncludeBatchBal": True}, headers=self._get_headers(), timeout=10)
+            if r.status_code == 200:
+                data = r.json().get("ResultTable", [])
+                for i in data: i['show_qty'] = self._get_qty(i)
+                return data[:limit]
+        except: return None
+
+    def get_stock_profile(self, keyword):
+        url = f"{self.base_url}/api/V2/Item/GetItem"
+        try:
+            r = requests.post(url, json={"ItemCode": [], "IncludeBatchBal": True}, headers=self._get_headers(), timeout=10)
+            if r.status_code == 200:
+                data = r.json().get("ResultTable", [])
+                keyword = keyword.lower()
+                for item in data:
+                    if keyword in item.get("ItemCode", "").lower() or keyword in item.get("Description", "").lower():
+                        item['show_qty'] = self._get_qty(item)
+                        return item
+        except: return None
+
+    # --- SALES FUNCTION ---
+    def get_sales_dashboard(self, specific_date_str=None):
         url = f"{self.base_url}/api/Invoice/GetInvoice"
         
-        # Determine Date Logic
-        if specific_date:
-            # If user asks for specific date (e.g. "2026/01/29")
-            target_date_str = specific_date
-            # For comparison stats, we usually compare vs the day before target
-            dt = datetime.strptime(specific_date, "%Y/%m/%d")
-            prev_date_str = (dt - timedelta(days=1)).strftime("%Y/%m/%d")
+        # Date Logic: If user gave a date, use it. Otherwise default to "Today"
+        if specific_date_str:
+            try:
+                target_dt = datetime.strptime(specific_date_str, "%Y/%m/%d")
+            except:
+                print(f"❌ Date Error: {specific_date_str}")
+                return None
         else:
-            # Default to Today vs Yesterday
-            now = datetime.now()
-            target_date_str = now.strftime("%Y/%m/%d")
-            prev_date_str = (now - timedelta(days=1)).strftime("%Y/%m/%d")
+            target_dt = datetime.now()
+
+        # Format for API: YYYY/MM/DD
+        target_date = target_dt.strftime("%Y/%m/%d")
+        prev_date = (target_dt - timedelta(days=1)).strftime("%Y/%m/%d")
         
-        # Request Data
-        payload = {"DateFrom": prev_date_str, "DateTo": target_date_str}
+        payload = {"DateFrom": prev_date, "DateTo": target_date}
         
         try:
             r = requests.post(url, json=payload, headers=self._get_headers(), timeout=15)
             if r.status_code == 200:
                 data = r.json().get("ResultTable", [])
+                stats = {"sales": 0.0, "prev_sales": 0.0, "count": 0, "date": target_date}
                 
-                stats = {
-                    "sales": 0.0,
-                    "prev_sales": 0.0,
-                    "count": 0,
-                    "top_product": "None",
-                    "top_qty": 0,
-                    "date": target_date_str
-                }
-                
-                product_tally = {}
-
                 for inv in data:
                     if inv.get("Cancelled") == "T": continue
+                    # API returns date like "2026-01-29T00:00:00". Take first 10 chars and ensure YYYY/MM/DD
+                    doc_date_raw = inv.get("DocDate", "")[:10].replace("-", "/")
                     
-                    doc_date = inv.get("DocDate", "")[:10].replace("-", "/")
                     amount = float(inv.get("FinalTotal", inv.get("NetTotal", 0.0)))
-
-                    if doc_date == target_date_str:
+                    
+                    if doc_date_raw == target_date:
                         stats["sales"] += amount
                         stats["count"] += 1
-                        if "IVDTL" in inv:
-                            for item in inv["IVDTL"]:
-                                code = item.get("ItemCode")
-                                qty = item.get("Qty", 0)
-                                desc = item.get("Description", code)
-                                if code:
-                                    product_tally[desc] = product_tally.get(desc, 0) + qty
-                                    
-                    elif doc_date == prev_date_str:
+                    elif doc_date_raw == prev_date:
                         stats["prev_sales"] += amount
-
-                if product_tally:
-                    best_seller = max(product_tally, key=product_tally.get)
-                    stats["top_product"] = best_seller
-                    stats["top_qty"] = product_tally[best_seller]
-
                 return stats
         except Exception as e:
-            print(f"Error fetching sales: {e}")
-
-    # --- FUNCTION 4: STOCK ---
-    def check_stock(self, keyword):
-        url = f"{self.base_url}/api/V2/Item/GetItem"
-        payload = {"ItemCode": [], "IncludeBatchBal": True}
-        try:
-            r = requests.post(url, json=payload, headers=self._get_headers(), timeout=10)
-            if r.status_code == 200:
-                data = r.json().get("ResultTable", [])
-                matches = []
-                for item in data:
-                    if keyword.lower() in item.get("ItemCode", "").lower() or keyword.lower() in item.get("Description", "").lower():
-                        qty = item.get("Qty", 0)
-                        if "ItemDTL" in item and item["ItemDTL"]:
-                            qty = item["ItemDTL"][0].get("BalQty", qty)
-                        matches.append({"code": item.get("ItemCode"), "desc": item.get("Description"), "qty": qty})
-                        if len(matches) >= 5: break
-                return matches
-        except:
+            print(f"Sales API Error: {e}")
             return None
-            
+
 ac_service = AutoCountService()
 
 # ==========================================
-# PART 2: AI BRAIN
+# PART 2: AI BRAIN (SMARTER DATE HANDLING)
 # ==========================================
 def ask_ai_intent(user_text):
     print(f"\n🧠 AI Processing: '{user_text}'...")
-    system_prompt = """
-    You are an AutoCount API Router. Map requests to these specific formats:
     
-    1. DEBTORS (General List):
-       - "Who owes money?" -> get_debtors: 5
-       - "Top 10 debtors" -> get_debtors: 10
-       - "List 3 bad payers" -> get_debtors: 3
+    # We give the AI the context of "NOW" so it can calculate dates
+    current_date = datetime.now().strftime("%Y/%m/%d")
+    current_day = datetime.now().strftime("%A")
+
+    system_prompt = f"""
+    You are an AutoCount API Assistant. Today is {current_day}, {current_date}.
     
-    2. DEBTOR PROFILE (Specific Company):
-       - "Info on Ali" -> get_debtor_profile: Ali
-       - "Details for ABC Corp" -> get_debtor_profile: ABC Corp
-       - "Look for Chew Choon" -> get_debtor_profile: Chew Choon
+    Your job is to map User Requests to Functions.
+    CRITICAL: You must convert ALL dates to "YYYY/MM/DD" format.
     
-    3. SALES:
-       - get_sales: "Sales today", "Sales for particular date", "Check latest sales"
-       - compare_sales: "Compare sales for two dates", "Compare today vs yesterday"
+    1. SALES (Single Date):
+    - "Sales today" -> get_sales: {current_date}
+    - "Sales yesterday" -> get_sales: [Calculated YYYY/MM/DD]
+    - "Sales for 29 Jan" -> get_sales: 2026/01/29 (Assume current year if not specified)
+    - "Sales for 2025/08/12" -> get_sales: 2025/08/12
+    
+    2. SALES COMPARISON (Two Dates):
+    - "Compare sales 29 Jan vs 12 Aug" -> compare_sales: 2026/01/29 | 2026/08/12
+    - "How is today compared to last week?" -> compare_sales: {current_date} | [Calculated Date]
+    
+    3. DEBTORS:
+    - "Top 3 debtors" -> list_debtors_outstanding: 3
+    - "Who owes money" -> list_debtors_outstanding: 5
+    - "List all customers" -> list_all_debtors
+    - "Profile for Ali" -> profile_debtor: Ali
     
     4. STOCK:
-       - "Check stock iPhone" -> check_stock: iPhone
+    - "List all items" -> list_all_stock
+    - "Check stock iPhone" -> profile_stock: iPhone
     
-    Reply ONLY with the formatted string. No JSON.
-
-
+    Reply ONLY with the formatted string. No Markdown. No Quotes.
     """
+    
     try:
         response = ollama.chat(model="deepseek-r1:8b", messages=[
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_text},
         ])
+        # Clean <think> tags and quotes
         reply = response['message']['content'].split('</think>')[-1].strip()
-        reply = reply.replace("`", "").strip() # Clean cleanup
+        reply = reply.replace('"', '').replace("'", "").replace("`", "")
         print(f"👉 Intent: {reply}")
         return reply
     except:
@@ -208,165 +209,114 @@ def ask_ai_intent(user_text):
 # ==========================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-    response = ask_ai_intent(user_text)
+    intent = ask_ai_intent(user_text)
     
-    # 1. TOP DEBTORS LIST
-    if "get_debtors" in response:
-        # Extract number (default to 5)
+    # ---------------- SALES HANDLERS ----------------
+    if "compare_sales" in intent:
+        # Extract the two dates separated by |
         try:
-            limit = int(re.search(r'\d+', response).group())
-        except:
-            limit = 5
+            dates = intent.split(":", 1)[-1].split("|")
+            date1 = dates[0].strip()
+            date2 = dates[1].strip()
             
-        await update.message.reply_text(f"📉 Listing Top {limit} Debtors...")
-        data = ac_service.get_debtors(limit)
-        
-        if data:
-            msg = f"🏆 **Top {len(data)} Outstanding Customers**\n━━━━━━━━━━━━━━━━━━\n"
-            i = 1
-            for item in data:
-                bal = float(item.get('Balance', item.get('Outstanding', 0.0)))
-                name = item.get('CompanyName')
-                # Try to get phone
-                phone = item.get('Phone1', item.get('Phone2', 'No Phone'))
-                
-                msg += f"{i}. {name}\n   💰 RM {bal:,.2f}\n   📞 {phone}\n\n"
-                i += 1
-            await update.message.reply_text(msg, parse_mode='Markdown')
-        else:
-            await update.message.reply_text("✅ No data found.")
-
-    # 2. SPECIFIC DEBTOR PROFILE (New!)
-    elif "get_debtor_profile" in response:
-        keyword = response.split(":", 1)[-1].strip()
-        await update.message.reply_text(f"📇 Searching profile for '{keyword}'...")
-        
-        item = ac_service.get_debtor_profile(keyword)
-        
-        if item:
-            # --- FIX: ADDRESS LOGIC ---
-            addr_parts = [
-                item.get('Address1'), 
-                item.get('Address2'), 
-                item.get('Address3'), 
-                item.get('Address4'),
-                item.get('PostCode'),
-                item.get('AreaCode'),
-                item.get('State')
-            ]
-            # Filter out None or empty strings and join them
-            full_address = ", ".join([str(p) for p in addr_parts if p])
-            if not full_address: full_address = "N/A"
+            await update.message.reply_text(f"📊 Comparing {date1} vs {date2}...")
             
-            bal = float(item.get('Balance', item.get('Outstanding', 0.0)))
-            limit = float(item.get('CreditLimit', 0.0))
-            term = item.get('DisplayTerm', 'N/A')
-            phone = item.get('Phone1', 'N/A')
-            fax = item.get('Fax1', 'N/A')
-            contact_person = item.get('Attention', 'N/A')
+            s1 = ac_service.get_sales_dashboard(date1)
+            s2 = ac_service.get_sales_dashboard(date2)
             
-            msg = (
-                f"👤 **Customer Profile**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🏢 **{item.get('CompanyName')}**\n"
-                f"🆔 Code: `{item.get('AccNo')}`\n"
-                f"💰 Balance: RM {bal:,.2f}\n"
-                f"💳 Limit: RM {limit:,.2f}\n"
-                f"📝 Term: {term}\n\n"
-                f"📍 **Address**\n{full_address}\n\n"
-                f"📞 **Contact**\n"
-                f"• Phone: {phone}\n"
-                f"• Fax: {fax}\n"
-                f"• Contact: {contact_person}"
-            )
-            await update.message.reply_text(msg, parse_mode='Markdown')
-        else:
-            await update.message.reply_text(f"❌ Customer '{keyword}' not found.")
-
-    # 3. COMPARISON MODE (NEW!)
-    elif "compare_sales" in response:
-        # Expected format: compare_sales: 2026-01-29 | 2025-08-12
-        try:
-            dates_part = response.split(":", 1)[-1].strip()
-            date_a, date_b = [d.strip() for d in dates_part.split("|")]
-            
-            # Normalize dates (Replace - with /)
-            date_a = date_a.replace("-", "/")
-            date_b = date_b.replace("-", "/")
-            
-            await update.message.reply_text(f"⚖️ Comparing **{date_a}** vs **{date_b}**...")
-            
-            # Fetch data twice
-            stats_a = ac_service.get_sales_dashboard(date_a)
-            stats_b = ac_service.get_sales_dashboard(date_b)
-            
-            if stats_a and stats_b:
-                diff = stats_a['sales'] - stats_b['sales']
+            if s1 and s2:
+                diff = s1['sales'] - s2['sales']
                 icon = "🟢" if diff >= 0 else "🔴"
-                
                 msg = (
-                    f"⚔️ **Sales Showdown**\n"
+                    f"⚔️ **Sales Comparison**\n"
+                    f"📅 **{s1['date']}**: RM {s1['sales']:,.2f}\n"
+                    f"📅 **{s2['date']}**: RM {s2['sales']:,.2f}\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📅 **{date_a}**: RM {stats_a['sales']:,.2f}\n"
-                    f"📅 **{date_b}**: RM {stats_b['sales']:,.2f}\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"**Difference:** {icon} RM {abs(diff):,.2f}\n"
+                    f"Difference: {icon} RM {abs(diff):,.2f}"
                 )
                 await update.message.reply_text(msg, parse_mode='Markdown')
             else:
-                await update.message.reply_text("❌ Could not fetch data for comparison.")
-                
-        except Exception as e:
-            print(f"Comparison Error: {e}")
-            await update.message.reply_text("⚠️ Could not process comparison dates.")
+                await update.message.reply_text("❌ Could not fetch data for one or both dates.")
+        except:
+             await update.message.reply_text("⚠️ Error parsing comparison dates.")
 
-    # 4. SALES DASHBOARD (SINGLE DATE)
-    elif "get_sales" in response:
-        # Extract Date
-        date_str = response.split(":", 1)[-1].strip()
-        
-        # Handle "latest" or empty
-        if "latest" in date_str or not date_str:
-            target_date = datetime.now().strftime("%Y/%m/%d")
-        else:
-            # Convert 2026-01-29 -> 2026/01/29
-            target_date = date_str.replace("-", "/")
-
+    elif "get_sales" in intent:
+        # Extract single date
+        target_date = intent.split(":", 1)[-1].strip()
         await update.message.reply_text(f"📆 Fetching sales for {target_date}...")
         
-        data = ac_service.get_sales_dashboard(target_date)
-        
-        if data:
-            diff = data['sales'] - data['prev_sales']
-            icon = "📈" if diff >= 0 else "📉"
-            top_prod = f"{data['top_product']} ({data['top_qty']} units)" if data['top_product'] != "None" else "None"
+        s = ac_service.get_sales_dashboard(target_date)
+        if s:
+            icon = "📈" if s['sales'] >= s['prev_sales'] else "📉"
+            await update.message.reply_text(
+                f"📅 **Sales: {s['date']}**\n"
+                f"💵 Revenue: RM {s['sales']:,.2f}\n"
+                f"🧾 Invoices: {s['count']}\n"
+                f"({icon} vs Prev Day: RM {s['prev_sales']:,.2f})", 
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text("❌ No sales data found for this date.")
 
+    # ---------------- DEBTOR HANDLERS ----------------
+    elif "list_debtors_outstanding" in intent:
+        # Extract limit number safely
+        try:
+            limit = int(re.search(r'\d+', intent).group())
+        except:
+            limit = 5
+            
+        await update.message.reply_text(f"📉 Fetching Top {limit} Debtors...")
+        data = ac_service.get_debtor_outstanding(limit)
+        msg = f"🏆 **Top {len(data)} Debtors**\n" + "\n".join([f"• {d['CompanyName']}: RM {d['show_bal']:,.2f}" for d in data]) if data else "✅ No debt."
+        await update.message.reply_text(msg, parse_mode='Markdown')
+
+    elif "list_all_debtors" in intent:
+        await update.message.reply_text("📂 Fetching Customer Directory...")
+        data = ac_service.get_debtor_list()
+        msg = "📂 **Customer List**\n" + "\n".join([f"• `{d['AccNo']}` {d['CompanyName']}" for d in data]) if data else "❌ No customers."
+        await update.message.reply_text(msg, parse_mode='Markdown')
+
+    elif "profile_debtor" in intent:
+        kw = intent.split(":", 1)[-1].strip()
+        await update.message.reply_text(f"🔍 Searching customer '{kw}'...")
+        d = ac_service.get_debtor_profile(kw)
+        if d:
+            addr = ", ".join(filter(None, [d.get(f'Address{i}') for i in range(1,5)] + [d.get('PostCode'), d.get('State')])) or "N/A"
+            msg = (f"👤 **{d['CompanyName']}**\n🆔 `{d['AccNo']}`\n💰 Bal: RM {d['show_bal']:,.2f}\n"
+                   f"📍 {addr}\n📞 {d.get('Phone1', 'N/A')} | 📠 {d.get('Fax1', 'N/A')}\n"
+                   f"💳 Limit: RM {d.get('CreditLimit',0):,.2f} | 📅 Term: {d.get('DisplayTerm','N/A')}")
+            await update.message.reply_text(msg, parse_mode='Markdown')
+        else:
+            await update.message.reply_text("❌ Customer not found.")
+
+    # ---------------- STOCK HANDLERS ----------------
+    elif "list_all_stock" in intent:
+        await update.message.reply_text("📦 Fetching Item Catalog...")
+        data = ac_service.get_stock_list()
+        msg = "📦 **Item Catalog**\n" + "\n".join([f"• `{i['ItemCode']}` {i['Description']}: **{i['show_qty']}**" for i in data]) if data else "❌ No items."
+        await update.message.reply_text(msg, parse_mode='Markdown')
+
+    elif "profile_stock" in intent:
+        kw = intent.split(":", 1)[-1].strip()
+        await update.message.reply_text(f"🔎 Checking stock '{kw}'...")
+        i = ac_service.get_stock_profile(kw)
+        if i:
             msg = (
-                f"📅 **Sales Pulse: {data['date']}**\n"
+                f"📦 **{i['Description']}**\n"
+                f"🔢 Code: `{i['ItemCode']}`\n"
+                f"📊 **Stock: {i['show_qty']} {i.get('UOM','UNIT')}**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"💵 **Revenue:** RM {data['sales']:,.2f}\n"
-                f"   *({icon} RM {abs(diff):,.2f} vs Prev Day)*\n\n"
-                f"🧾 **Invoices:** {data['count']}\n"
-                f"🏆 **Top Seller:** {top_prod}"
+                f"💵 Price: RM {i.get('RefPrice', i.get('Price', 0.0)):,.2f}\n"
+                f"🛠 Cost: RM {i.get('StdCost', 0.0):,.2f}\n"
+                f"📂 Group: {i.get('ItemGroup', 'N/A')} | Type: {i.get('ItemType', 'N/A')}\n"
             )
             await update.message.reply_text(msg, parse_mode='Markdown')
         else:
-            await update.message.reply_text("❌ No data found.")
+            await update.message.reply_text("❌ Item not found.")
 
-    # 4. STOCK
-    elif "check_stock" in response:
-        keyword = response.split(":", 1)[-1].strip()
-        items = ac_service.check_stock(keyword)
-        if items:
-            msg = ""
-            for i in items:
-                msg += f"📦 {i['desc']}: **{i['qty']}**\n"
-            await update.message.reply_text(msg, parse_mode='Markdown')
-        else:
-            await update.message.reply_text("❌ Item not found")
-            
     else:
-        await update.message.reply_text("🤖 I am ready.")
+        await update.message.reply_text("🤖 I'm ready. Ask about sales, debtors, or stock.")
 
 if __name__ == '__main__':
     TELEGRAM_TOKEN = "8274589592:AAHJgltCVJ_s4VwQoLRpFvsNJJc-M0ycs6k"
