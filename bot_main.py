@@ -35,7 +35,7 @@ class AutoCountService:
         if not self.auth_key: self.login()
         return {"Content-Type": "application/json", "Authorization": self.auth_key}
 
-    # --- FUNCTION 1: DEBTOR LIST (Flexible Limit) ---
+    # --- FINANCIALS ---
     def get_debtors(self, limit=5):
         url = f"{self.base_url}/api/Debtor/GetDebtor/"
         payload = {"AccNo": []} 
@@ -43,8 +43,6 @@ class AutoCountService:
             r = requests.post(url, json=payload, headers=self._get_headers(), timeout=10)
             if r.status_code == 200:
                 data = r.json()
-                # Sort by Balance (Descending) to show highest debt first
-                # We normalize field names (Balance vs Outstanding)
                 sorted_data = sorted(
                     data, 
                     key=lambda x: float(x.get('Balance', x.get('Outstanding', 0.0))), 
@@ -55,27 +53,24 @@ class AutoCountService:
             print(f"Error fetching debtors: {e}")
         return None
 
-    # --- FUNCTION 2: DEBTOR PROFILE (Detailed Lookup) ---
     def get_debtor_profile(self, keyword):
         url = f"{self.base_url}/api/Debtor/GetDebtor/"
-        payload = {"AccNo": []} # Fetch all to search
+        payload = {"AccNo": []}
         try:
             r = requests.post(url, json=payload, headers=self._get_headers(), timeout=10)
             if r.status_code == 200:
                 data = r.json()
                 keyword = keyword.lower()
-                
                 for item in data:
                     name = item.get("CompanyName", "").lower()
                     code = item.get("AccNo", "").lower()
-                    
                     if keyword in name or keyword in code:
-                        return item # Return the specific dictionary
+                        return item 
         except Exception as e:
             print(f"Error fetching profile: {e}")
         return None
 
-    # --- FUNCTION 3: SALES DASHBOARD ---
+    # --- SALES ---
     def get_sales_dashboard(self, specific_date=None):
         url = f"{self.base_url}/api/Invoice/GetInvoice"
         if specific_date:
@@ -107,26 +102,86 @@ class AutoCountService:
         except:
             return None
 
-    # --- FUNCTION 4: STOCK ---
-    def check_stock(self, keyword):
+    # --- STOCK (NEW & IMPROVED) ---
+    
+    def get_all_stocks(self, limit=20):
+        """Fetches ALL stocks without filter, limited to N items to prevent spam."""
         url = f"{self.base_url}/api/V2/Item/GetItem"
+        # IncludeBatchBal=True ensures we get the ItemDTL for quantity
         payload = {"ItemCode": [], "IncludeBatchBal": True}
+        
         try:
             r = requests.post(url, json=payload, headers=self._get_headers(), timeout=10)
             if r.status_code == 200:
                 data = r.json().get("ResultTable", [])
-                matches = []
+                results = []
+                for item in data[:limit]: # Slice list to limit
+                    qty = 0.0
+                    if "ItemDTL" in item and item["ItemDTL"]:
+                        qty = item["ItemDTL"][0].get("BalQty", 0.0)
+                    
+                    results.append({
+                        "code": item.get("ItemCode"),
+                        "desc": item.get("Description"),
+                        "qty": qty,
+                        "uom": item.get("BaseUOM", "UNIT")
+                    })
+                return results
+        except Exception as e:
+            print(f"Error all stocks: {e}")
+        return None
+
+    def get_stock_detail(self, keyword):
+        """Deep search for a single item to show FULL details."""
+        url = f"{self.base_url}/api/V2/Item/GetItem"
+        payload = {"ItemCode": [], "IncludeBatchBal": True}
+        
+        try:
+            r = requests.post(url, json=payload, headers=self._get_headers(), timeout=10)
+            if r.status_code == 200:
+                data = r.json().get("ResultTable", [])
+                keyword = keyword.lower()
+                
                 for item in data:
-                    if keyword.lower() in item.get("ItemCode", "").lower() or keyword.lower() in item.get("Description", "").lower():
-                        qty = item.get("Qty", 0)
+                    # Match against Code or Description
+                    if keyword in item.get("ItemCode", "").lower() or keyword in item.get("Description", "").lower():
+                        
+                        # --- DATA EXTRACTION ---
+                        # Extract UOM details (Cost/Price often hidden here)
+                        uom_list = item.get("ItemUOM", [])
+                        price = 0.0
+                        cost = 0.0
+                        
+                        # Try to find Standard Cost/Price in UOM list
+                        if uom_list:
+                            first_uom = uom_list[0]
+                            price = first_uom.get("Price", first_uom.get("StdSalePrice", 0.0))
+                            cost = first_uom.get("Cost", first_uom.get("StdCost", 0.0))
+                        
+                        # Fallback to main item fields if UOM empty
+                        if price == 0: price = item.get("RefPrice", 0.0)
+                        if cost == 0: cost = item.get("RefCost", 0.0)
+
+                        qty = 0.0
                         if "ItemDTL" in item and item["ItemDTL"]:
-                            qty = item["ItemDTL"][0].get("BalQty", qty)
-                        matches.append({"code": item.get("ItemCode"), "desc": item.get("Description"), "qty": qty})
-                        if len(matches) >= 5: break
-                return matches
-        except:
-            return None
-            
+                            qty = item["ItemDTL"][0].get("BalQty", 0.0)
+
+                        return {
+                            "code": item.get("ItemCode"),
+                            "desc": item.get("Description"),
+                            "group": item.get("ItemGroup", "N/A"),
+                            "type": item.get("ItemType", "N/A"),
+                            "qty": qty,
+                            "uom": item.get("BaseUOM", "UNIT"),
+                            "price": price,
+                            "cost": cost,
+                            "active": item.get("IsActive", "T"),
+                            "tax_type": item.get("SupplyTaxCode", "None")
+                        }
+        except Exception as e:
+            print(f"Error detail stock: {e}")
+        return None
+
 ac_service = AutoCountService()
 
 # ==========================================
@@ -137,22 +192,24 @@ def ask_ai_intent(user_text):
     system_prompt = """
     You are an AutoCount API Router. Map requests to these specific formats:
     
-    1. DEBTORS (General List):
+    1. DEBTORS:
        - "Who owes money?" -> get_debtors: 5
        - "Top 10 debtors" -> get_debtors: 10
-       - "List 3 bad payers" -> get_debtors: 3
-    
-    2. DEBTOR PROFILE (Specific Company):
        - "Info on Ali" -> get_debtor_profile: Ali
-       - "Details for ABC Corp" -> get_debtor_profile: ABC Corp
-       - "Look for Chew Choon" -> get_debtor_profile: Chew Choon
     
-    3. SALES:
+    2. SALES:
        - "Sales today" -> get_sales: latest
+       - "Check sales for 2026-01-29" -> get_sales: 2026/01/29
     
-    4. STOCK:
-       - "Check stock iPhone" -> check_stock: iPhone
+    3. STOCK (NEW RULES):
+       - "List all stocks", "Show me inventory", "Check all items" -> list_all_stocks
+       - "Details for iPhone", "Full info on item A", "Give me information of stock A" -> stock_detail: A
+       - "Check stock for iPhone" -> stock_detail: iPhone
+       - "Do we have item X?" -> stock_detail: X
     
+    4. CASUAL:
+       - "Hi", "Thanks" -> none
+
     Reply ONLY with the formatted string. No JSON.
     """
     try:
@@ -161,7 +218,7 @@ def ask_ai_intent(user_text):
             {'role': 'user', 'content': user_text},
         ])
         reply = response['message']['content'].split('</think>')[-1].strip()
-        reply = reply.replace("`", "").strip() # Clean cleanup
+        reply = reply.replace("`", "").strip()
         print(f"👉 Intent: {reply}")
         return reply
     except:
@@ -174,105 +231,102 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     response = ask_ai_intent(user_text)
     
-    # 1. TOP DEBTORS LIST
+    # 1. DEBTORS
     if "get_debtors" in response:
-        # Extract number (default to 5)
         try:
             limit = int(re.search(r'\d+', response).group())
         except:
             limit = 5
-            
         await update.message.reply_text(f"📉 Listing Top {limit} Debtors...")
         data = ac_service.get_debtors(limit)
-        
         if data:
-            msg = f"🏆 **Top {len(data)} Outstanding Customers**\n━━━━━━━━━━━━━━━━━━\n"
-            i = 1
+            msg = f"🏆 **Top {len(data)} Debtors**\n━━━━━━━━━━\n"
             for item in data:
                 bal = float(item.get('Balance', item.get('Outstanding', 0.0)))
-                name = item.get('CompanyName')
-                # Try to get phone
-                phone = item.get('Phone1', item.get('Phone2', 'No Phone'))
-                
-                msg += f"{i}. {name}\n   💰 RM {bal:,.2f}\n   📞 {phone}\n\n"
-                i += 1
+                msg += f"🔹 {item.get('CompanyName')}: RM {bal:,.2f}\n"
             await update.message.reply_text(msg, parse_mode='Markdown')
         else:
             await update.message.reply_text("✅ No data found.")
 
-    # 2. SPECIFIC DEBTOR PROFILE (New!)
     elif "get_debtor_profile" in response:
         keyword = response.split(":", 1)[-1].strip()
-        await update.message.reply_text(f"📇 Searching profile for '{keyword}'...")
-        
+        await update.message.reply_text(f"📇 Finding '{keyword}'...")
         item = ac_service.get_debtor_profile(keyword)
-        
         if item:
-            # --- FIX: ADDRESS LOGIC ---
-            addr_parts = [
-                item.get('Address1'), 
-                item.get('Address2'), 
-                item.get('Address3'), 
-                item.get('Address4'),
-                item.get('PostCode'),
-                item.get('AreaCode'),
-                item.get('State')
-            ]
-            # Filter out None or empty strings and join them
-            full_address = ", ".join([str(p) for p in addr_parts if p])
-            if not full_address: full_address = "N/A"
-            
-            bal = float(item.get('Balance', item.get('Outstanding', 0.0)))
-            limit = float(item.get('CreditLimit', 0.0))
-            term = item.get('DisplayTerm', 'N/A')
-            phone = item.get('Phone1', 'N/A')
-            fax = item.get('Fax1', 'N/A')
-            contact_person = item.get('Attention', 'N/A')
-            
-            msg = (
-                f"👤 **Customer Profile**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🏢 **{item.get('CompanyName')}**\n"
-                f"🆔 Code: `{item.get('AccNo')}`\n"
-                f"💰 Balance: RM {bal:,.2f}\n"
-                f"💳 Limit: RM {limit:,.2f}\n"
-                f"📝 Term: {term}\n\n"
-                f"📍 **Address**\n{full_address}\n\n"
-                f"📞 **Contact**\n"
-                f"• Phone: {phone}\n"
-                f"• Fax: {fax}\n"
-                f"• Contact: {contact_person}"
-            )
+            addr = f"{item.get('Address1', '')} {item.get('Address2', '')} {item.get('Address3', '')}"
+            msg = (f"👤 **{item.get('CompanyName')}**\n"
+                   f"🆔 {item.get('AccNo')}\n"
+                   f"💰 Balance: RM {float(item.get('Balance',0)):,.2f}\n"
+                   f"📍 {addr}")
             await update.message.reply_text(msg, parse_mode='Markdown')
         else:
-            await update.message.reply_text(f"❌ Customer '{keyword}' not found.")
+            await update.message.reply_text("❌ Not found.")
 
-    # 3. SALES
+    # 2. SALES
     elif "get_sales" in response:
-        await update.message.reply_text("💰 Checking Today's Sales...")
-        data = ac_service.get_sales_dashboard()
+        date_param = response.split(":", 1)[-1].strip()
+        date_arg = None if "latest" in date_param else date_param
+        
+        await update.message.reply_text("💰 Checking Sales...")
+        data = ac_service.get_sales_dashboard(date_arg)
         if data:
             diff = data['sales'] - data['prev_sales']
             icon = "📈" if diff >= 0 else "📉"
             msg = (f"📅 **Sales: {data['date']}**\n"
-                   f"💸 Revenue: RM {data['sales']:,.2f}\n"
-                   f"   ({icon} RM {abs(diff):,.2f} vs Yesterday)")
-            await update.message.reply_text(msg, parse_mode='Markdown')
-
-    # 4. STOCK
-    elif "check_stock" in response:
-        keyword = response.split(":", 1)[-1].strip()
-        items = ac_service.check_stock(keyword)
-        if items:
-            msg = ""
-            for i in items:
-                msg += f"📦 {i['desc']}: **{i['qty']}**\n"
+                   f"💸 Rev: RM {data['sales']:,.2f}\n"
+                   f"   ({icon} RM {abs(diff):,.2f} vs Prev)")
             await update.message.reply_text(msg, parse_mode='Markdown')
         else:
-            await update.message.reply_text("❌ Item not found")
+            await update.message.reply_text("❌ No data.")
+
+    # 3. LIST ALL STOCKS (NEW)
+    elif response == "list_all_stocks":
+        await update.message.reply_text("📦 Fetching inventory list (Top 20)...")
+        items = ac_service.get_all_stocks(limit=20)
+        
+        if items:
+            msg = "📦 **Inventory Summary**\n━━━━━━━━━━━━━━━━━━\n"
+            for i in items:
+                status = "✅" if i['qty'] > 0 else "🔻"
+                msg += f"{status} `{i['code']}`: {i['qty']} {i['uom']}\n"
+            
+            msg += "\n💡 *Tip: Ask 'Details for [item]' to see price & cost.*"
+            await update.message.reply_text(msg, parse_mode='Markdown')
+        else:
+            await update.message.reply_text("❌ No items found in database.")
+
+    # 4. STOCK DETAILS (NEW)
+    elif "stock_detail" in response:
+        keyword = response.split(":", 1)[-1].strip()
+        if not keyword:
+            await update.message.reply_text("📦 Which item?")
+            return
+
+        await update.message.reply_text(f"🔍 Pulling full specs for '{keyword}'...")
+        i = ac_service.get_stock_detail(keyword)
+        
+        if i:
+            active_icon = "🟢 Active" if i['active'] == "T" else "🔴 Inactive"
+            msg = (
+                f"📦 **Product Specification**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏷 **{i['desc']}**\n"
+                f"🔑 Code: `{i['code']}`\n"
+                f"📂 Group: {i['group']} | Type: {i['type']}\n"
+                f"📊 Status: {active_icon}\n\n"
+                f"🔢 **Stock Level**\n"
+                f"   👉 {i['qty']} {i['uom']}\n\n"
+                f"💲 **Pricing**\n"
+                f"   💵 Price: RM {i['price']:,.2f}\n"
+                f"   🛠 Cost:  RM {i['cost']:,.2f}\n"
+                f"   ⚖️ Tax:   {i['tax_type']}"
+            )
+            await update.message.reply_text(msg, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(f"❌ Item '{keyword}' not found.")
             
     else:
-        await update.message.reply_text("🤖 I am ready.")
+        await update.message.reply_text("🤖 Ready. Try 'List all stocks' or 'Details for [Item]'.")
 
 if __name__ == '__main__':
     TELEGRAM_TOKEN = "8274589592:AAHJgltCVJ_s4VwQoLRpFvsNJJc-M0ycs6k"
