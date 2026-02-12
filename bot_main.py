@@ -4,11 +4,11 @@ import json
 import ollama
 import re
 from datetime import datetime, timedelta
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
 # ==========================================
-# PART 1: AUTOCOUNT BRIDGE ( unchanged )
+# PART 1: AUTOCOUNT BRIDGE ( Unchanged )
 # ==========================================
 class AutoCountService:
     def __init__(self):
@@ -153,7 +153,7 @@ class AutoCountService:
 ac_service = AutoCountService()
 
 # ==========================================
-# PART 2: AI BRAIN (SMARTER DATE HANDLING)
+# PART 2: AI BRAIN ( Unchanged )
 # ==========================================
 def ask_ai_intent(user_text):
     print(f"\n🧠 AI Processing: '{user_text}'...")
@@ -205,22 +205,124 @@ def ask_ai_intent(user_text):
         return "error"
 
 # ==========================================
-# PART 3: HANDLERS
+# PART 3: NEW UI DASHBOARD
+# ==========================================
+async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the main menu with Inline Buttons."""
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Today's Sales", callback_data='btn_sales_today'),
+            InlineKeyboardButton("📉 Yesterday", callback_data='btn_sales_yesterday')
+        ],
+        [
+            InlineKeyboardButton("🏆 Top Debtors", callback_data='btn_debtors_top'),
+            InlineKeyboardButton("👥 Customer List", callback_data='btn_debtors_all')
+        ],
+        [
+            InlineKeyboardButton("📦 Stock Catalog", callback_data='btn_stock_list'),
+        ],
+        [
+             InlineKeyboardButton("🔍 Help / Search Tips", callback_data='btn_help')
+        ]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    msg_text = (
+        "🤖 **AutoCount AI Dashboard**\n"
+        "Select an option below or type your request naturally.\n"
+        "*(e.g., 'Check price of iPhone', 'Compare sales today vs last Monday')*"
+    )
+    
+    # Handle both new messages and callback edits
+    if update.message:
+        await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode='Markdown')
+    elif update.callback_query:
+        # If calling from a "Back" button, we edit the old message
+        await update.callback_query.message.edit_text(msg_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles button clicks directly (No AI needed for these)."""
+    query = update.callback_query
+    await query.answer() # Acknowledge click to stop loading animation
+    
+    data = query.data
+    
+    if data == 'btn_sales_today':
+        target_date = datetime.now().strftime("%Y/%m/%d")
+        s = ac_service.get_sales_dashboard(target_date)
+        if s:
+            icon = "📈" if s['sales'] >= s['prev_sales'] else "📉"
+            msg = (
+                f"📊 **Sales Dashboard: Today**\n"
+                f"💵 Revenue: RM {s['sales']:,.2f}\n"
+                f"🧾 Invoices: {s['count']}\n"
+                f"({icon} vs Prev Day: RM {s['prev_sales']:,.2f})"
+            )
+            await query.message.reply_text(msg, parse_mode='Markdown')
+        else:
+            await query.message.reply_text("❌ No data for today.")
+
+    elif data == 'btn_sales_yesterday':
+        target_date = (datetime.now() - timedelta(days=1)).strftime("%Y/%m/%d")
+        s = ac_service.get_sales_dashboard(target_date)
+        if s:
+            msg = (f"📉 **Sales: Yesterday ({s['date']})**\n"
+                   f"💵 Revenue: RM {s['sales']:,.2f}\n"
+                   f"🧾 Invoices: {s['count']}")
+            await query.message.reply_text(msg, parse_mode='Markdown')
+        else:
+             await query.message.reply_text("❌ No data for yesterday.")
+
+    elif data == 'btn_debtors_top':
+        data = ac_service.get_debtor_outstanding(5)
+        msg = f"🏆 **Top 5 Debtors**\n" + "\n".join([f"• {d['CompanyName']}: RM {d['show_bal']:,.2f}" for d in data]) if data else "✅ No outstanding debt."
+        await query.message.reply_text(msg, parse_mode='Markdown')
+
+    elif data == 'btn_debtors_all':
+        data = ac_service.get_debtor_list()
+        msg = "👥 **Customer Directory**\n" + "\n".join([f"• `{d['AccNo']}` {d['CompanyName']}" for d in data]) if data else "❌ No customers found."
+        await query.message.reply_text(msg, parse_mode='Markdown')
+
+    elif data == 'btn_stock_list':
+        data = ac_service.get_stock_list()
+        msg = "📦 **Stock Catalog**\n" + "\n".join([f"• `{i['ItemCode']}` {i['Description']}: **{i['show_qty']}**" for i in data]) if data else "❌ No items found."
+        await query.message.reply_text(msg, parse_mode='Markdown')
+        
+    elif data == 'btn_help':
+        msg = (
+            "💡 **How to use AutoCount AI**\n\n"
+            "**1. Use the Buttons:** Click the menu options for quick reports.\n"
+            "**2. Chat Naturally:**\n"
+            "• 'Check stock for iPhone'\n"
+            "• 'Who represents ABC Company?'\n"
+            "• 'Sales for 25th Dec'\n"
+            "• 'Compare sales today vs last week'"
+        )
+        await query.message.reply_text(msg, parse_mode='Markdown')
+
+# ==========================================
+# PART 4: TEXT HANDLER (AI & COMMANDS)
 # ==========================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
+    
+    # If user types /start or menu, show dashboard
+    if user_text.lower() in ['/start', 'menu', 'help', 'hi', 'hello']:
+        await show_dashboard(update, context)
+        return
+
+    # Otherwise, pass to AI
     intent = ask_ai_intent(user_text)
     
     # ---------------- SALES HANDLERS ----------------
     if "compare_sales" in intent:
-        # Extract the two dates separated by |
         try:
             dates = intent.split(":", 1)[-1].split("|")
-            date1 = dates[0].strip()
-            date2 = dates[1].strip()
+            date1, date2 = dates[0].strip(), dates[1].strip()
             
             await update.message.reply_text(f"📊 Comparing {date1} vs {date2}...")
-            
             s1 = ac_service.get_sales_dashboard(date1)
             s2 = ac_service.get_sales_dashboard(date2)
             
@@ -241,7 +343,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
              await update.message.reply_text("⚠️ Error parsing comparison dates.")
 
     elif "get_sales" in intent:
-        # Extract single date
         target_date = intent.split(":", 1)[-1].strip()
         await update.message.reply_text(f"📆 Fetching sales for {target_date}...")
         
@@ -260,12 +361,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------------- DEBTOR HANDLERS ----------------
     elif "list_debtors_outstanding" in intent:
-        # Extract limit number safely
         try:
             limit = int(re.search(r'\d+', intent).group())
         except:
             limit = 5
-            
         await update.message.reply_text(f"📉 Fetching Top {limit} Debtors...")
         data = ac_service.get_debtor_outstanding(limit)
         msg = f"🏆 **Top {len(data)} Debtors**\n" + "\n".join([f"• {d['CompanyName']}: RM {d['show_bal']:,.2f}" for d in data]) if data else "✅ No debt."
@@ -316,11 +415,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Item not found.")
 
     else:
-        await update.message.reply_text("🤖 I'm ready. Ask about sales, debtors, or stock.")
+        # Fallback to Dashboard if AI is confused
+        await show_dashboard(update, context)
 
 if __name__ == '__main__':
     TELEGRAM_TOKEN = "8274589592:AAHJgltCVJ_s4VwQoLRpFvsNJJc-M0ycs6k"
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    
+    # Add Handlers
+    app.add_handler(CommandHandler("start", show_dashboard))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    print("🚀 AutoCount AI Agent is Running...")
+    
+    print("🚀 AutoCount AI Agent is Running (With UI Dashboard)...")
     app.run_polling()
