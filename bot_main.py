@@ -2,6 +2,7 @@
 import requests
 import json
 import ollama
+import re
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
@@ -18,7 +19,6 @@ class AutoCountService:
         self.auth_key = None
 
     def login(self):
-        """Authenticates and retrieves the JWT Token."""
         url = f"{self.base_url}/api/v3/Login"
         payload = {"UserID": self.user_id, "Password": self.password, "Token": self.token}
         try:
@@ -35,18 +35,47 @@ class AutoCountService:
         if not self.auth_key: self.login()
         return {"Content-Type": "application/json", "Authorization": self.auth_key}
 
-    # --- FUNCTION 1: FINANCIALS (DEBTORS) ---
-    def get_debtors(self):
+    # --- FUNCTION 1: DEBTOR LIST (Flexible Limit) ---
+    def get_debtors(self, limit=5):
         url = f"{self.base_url}/api/Debtor/GetDebtor/"
-        payload = {"AccNo": []}
+        payload = {"AccNo": []} 
         try:
             r = requests.post(url, json=payload, headers=self._get_headers(), timeout=10)
-            if r.status_code == 200: return r.json()
+            if r.status_code == 200:
+                data = r.json()
+                # Sort by Balance (Descending) to show highest debt first
+                # We normalize field names (Balance vs Outstanding)
+                sorted_data = sorted(
+                    data, 
+                    key=lambda x: float(x.get('Balance', x.get('Outstanding', 0.0))), 
+                    reverse=True
+                )
+                return sorted_data[:limit]
         except Exception as e:
             print(f"Error fetching debtors: {e}")
         return None
 
-    # --- FUNCTION 2: SALES DASHBOARD ---
+    # --- FUNCTION 2: DEBTOR PROFILE (Detailed Lookup) ---
+    def get_debtor_profile(self, keyword):
+        url = f"{self.base_url}/api/Debtor/GetDebtor/"
+        payload = {"AccNo": []} # Fetch all to search
+        try:
+            r = requests.post(url, json=payload, headers=self._get_headers(), timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                keyword = keyword.lower()
+                
+                for item in data:
+                    name = item.get("CompanyName", "").lower()
+                    code = item.get("AccNo", "").lower()
+                    
+                    if keyword in name or keyword in code:
+                        return item # Return the specific dictionary
+        except Exception as e:
+            print(f"Error fetching profile: {e}")
+        return None
+
+    # --- FUNCTION 3: SALES DASHBOARD ---
     def get_sales_dashboard(self, specific_date=None):
         url = f"{self.base_url}/api/Invoice/GetInvoice"
         
@@ -110,9 +139,8 @@ class AutoCountService:
                 return stats
         except Exception as e:
             print(f"Error fetching sales: {e}")
-        return None
 
-    # --- FUNCTION 3: STOCK CHECKER ---
+    # --- FUNCTION 4: STOCK ---
     def check_stock(self, keyword):
         url = f"{self.base_url}/api/V2/Item/GetItem"
         payload = {"ItemCode": [], "IncludeBatchBal": True}
@@ -121,49 +149,47 @@ class AutoCountService:
             if r.status_code == 200:
                 data = r.json().get("ResultTable", [])
                 matches = []
-                keyword = keyword.lower()
                 for item in data:
-                    code = item.get("ItemCode", "").lower()
-                    desc = item.get("Description", "").lower()
-                    if keyword in code or keyword in desc:
-                        qty = 0
-                        uom = "UNIT"
-                        if "ItemDTL" in item and len(item["ItemDTL"]) > 0:
-                            first_dtl = item["ItemDTL"][0]
-                            qty = first_dtl.get("BalQty", first_dtl.get("Qty", 0))
-                            uom = first_dtl.get("UOM", "UNIT")
-                        matches.append({"code": item.get("ItemCode"), "desc": item.get("Description"), "qty": qty, "uom": uom})
+                    if keyword.lower() in item.get("ItemCode", "").lower() or keyword.lower() in item.get("Description", "").lower():
+                        qty = item.get("Qty", 0)
+                        if "ItemDTL" in item and item["ItemDTL"]:
+                            qty = item["ItemDTL"][0].get("BalQty", qty)
+                        matches.append({"code": item.get("ItemCode"), "desc": item.get("Description"), "qty": qty})
                         if len(matches) >= 5: break
                 return matches
-        except Exception as e:
-            print(f"Error fetching stock: {e}")
-        return None
-
+        except:
+            return None
+            
 ac_service = AutoCountService()
 
 # ==========================================
-# PART 2: AI BRAIN (RE-TRAINED)
+# PART 2: AI BRAIN
 # ==========================================
 def ask_ai_intent(user_text):
     print(f"\n🧠 AI Processing: '{user_text}'...")
     system_prompt = """
-    You are an API Router for AutoCount Accounting.
+    You are an AutoCount API Router. Map requests to these specific formats:
     
-    Functions:
-    - get_debtors: "Who owes money?", "List debtors"
-    - get_sales: "Sales today", "Sales for Jan 29", "Check latest sales"
-    - compare_sales: "Compare sales for Jan 29 and Aug 12", "Compare today vs yesterday"
-    - check_stock: "Check stock for iPhone"
-    - none: Casual chat.
+    1. DEBTORS (General List):
+       - "Who owes money?" -> get_debtors: 5
+       - "Top 10 debtors" -> get_debtors: 10
+       - "List 3 bad payers" -> get_debtors: 3
+    
+    2. DEBTOR PROFILE (Specific Company):
+       - "Info on Ali" -> get_debtor_profile: Ali
+       - "Details for ABC Corp" -> get_debtor_profile: ABC Corp
+       - "Look for Chew Choon" -> get_debtor_profile: Chew Choon
+    
+    3. SALES:
+       - get_sales: "Sales today", "Sales for particular date", "Check latest sales"
+       - compare_sales: "Compare sales for two dates", "Compare today vs yesterday"
+    
+    4. STOCK:
+       - "Check stock iPhone" -> check_stock: iPhone
+    
+    Reply ONLY with the formatted string. No JSON.
 
-    RULES:
-    1. For single dates, return: get_sales: YYYY-MM-DD
-       (If user says "latest", return: get_sales: latest)
-    
-    2. For COMPARISONS, return: compare_sales: YYYY-MM-DD | YYYY-MM-DD
-       Example: "Compare Jan 1 and Feb 1" -> compare_sales: 2026-01-01 | 2026-02-01
-    
-    3. NEVER return JSON. NEVER return markdown code blocks. Just the string.
+
     """
     try:
         response = ollama.chat(model="deepseek-r1:8b", messages=[
@@ -171,40 +197,93 @@ def ask_ai_intent(user_text):
             {'role': 'user', 'content': user_text},
         ])
         reply = response['message']['content'].split('</think>')[-1].strip()
-        
-        # Clean up if AI still sends markdown code blocks
-        reply = reply.replace("```json", "").replace("```", "").strip()
-        
+        reply = reply.replace("`", "").strip() # Clean cleanup
         print(f"👉 Intent: {reply}")
         return reply
     except:
         return "error"
 
 # ==========================================
-# PART 3: HANDLERS (NEW LOGIC)
+# PART 3: HANDLERS
 # ==========================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     response = ask_ai_intent(user_text)
     
-    # 1. DEBTORS
+    # 1. TOP DEBTORS LIST
     if "get_debtors" in response:
-        await update.message.reply_text("🔍 Checking outstanding balances...")
-        data = ac_service.get_debtors()
+        # Extract number (default to 5)
+        try:
+            limit = int(re.search(r'\d+', response).group())
+        except:
+            limit = 5
+            
+        await update.message.reply_text(f"📉 Listing Top {limit} Debtors...")
+        data = ac_service.get_debtors(limit)
+        
         if data:
-            msg = "📊 **Debtor Aging Summary**\n"
-            total = 0.0
-            for item in data[:10]:
+            msg = f"🏆 **Top {len(data)} Outstanding Customers**\n━━━━━━━━━━━━━━━━━━\n"
+            i = 1
+            for item in data:
                 bal = float(item.get('Balance', item.get('Outstanding', 0.0)))
-                if bal > 0:
-                    msg += f"🔹 {item.get('CompanyName')}: RM {bal:,.2f}\n"
-                    total += bal
-            msg += f"\n💰 **Total Visible: RM {total:,.2f}**"
+                name = item.get('CompanyName')
+                # Try to get phone
+                phone = item.get('Phone1', item.get('Phone2', 'No Phone'))
+                
+                msg += f"{i}. {name}\n   💰 RM {bal:,.2f}\n   📞 {phone}\n\n"
+                i += 1
             await update.message.reply_text(msg, parse_mode='Markdown')
         else:
-            await update.message.reply_text("✅ No outstanding debtors.")
+            await update.message.reply_text("✅ No data found.")
 
-    # 2. COMPARISON MODE (NEW!)
+    # 2. SPECIFIC DEBTOR PROFILE (New!)
+    elif "get_debtor_profile" in response:
+        keyword = response.split(":", 1)[-1].strip()
+        await update.message.reply_text(f"📇 Searching profile for '{keyword}'...")
+        
+        item = ac_service.get_debtor_profile(keyword)
+        
+        if item:
+            # --- FIX: ADDRESS LOGIC ---
+            addr_parts = [
+                item.get('Address1'), 
+                item.get('Address2'), 
+                item.get('Address3'), 
+                item.get('Address4'),
+                item.get('PostCode'),
+                item.get('AreaCode'),
+                item.get('State')
+            ]
+            # Filter out None or empty strings and join them
+            full_address = ", ".join([str(p) for p in addr_parts if p])
+            if not full_address: full_address = "N/A"
+            
+            bal = float(item.get('Balance', item.get('Outstanding', 0.0)))
+            limit = float(item.get('CreditLimit', 0.0))
+            term = item.get('DisplayTerm', 'N/A')
+            phone = item.get('Phone1', 'N/A')
+            fax = item.get('Fax1', 'N/A')
+            contact_person = item.get('Attention', 'N/A')
+            
+            msg = (
+                f"👤 **Customer Profile**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏢 **{item.get('CompanyName')}**\n"
+                f"🆔 Code: `{item.get('AccNo')}`\n"
+                f"💰 Balance: RM {bal:,.2f}\n"
+                f"💳 Limit: RM {limit:,.2f}\n"
+                f"📝 Term: {term}\n\n"
+                f"📍 **Address**\n{full_address}\n\n"
+                f"📞 **Contact**\n"
+                f"• Phone: {phone}\n"
+                f"• Fax: {fax}\n"
+                f"• Contact: {contact_person}"
+            )
+            await update.message.reply_text(msg, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(f"❌ Customer '{keyword}' not found.")
+
+    # 3. COMPARISON MODE (NEW!)
     elif "compare_sales" in response:
         # Expected format: compare_sales: 2026-01-29 | 2025-08-12
         try:
@@ -241,7 +320,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"Comparison Error: {e}")
             await update.message.reply_text("⚠️ Could not process comparison dates.")
 
-    # 3. SALES DASHBOARD (SINGLE DATE)
+    # 4. SALES DASHBOARD (SINGLE DATE)
     elif "get_sales" in response:
         # Extract Date
         date_str = response.split(":", 1)[-1].strip()
@@ -277,21 +356,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 4. STOCK
     elif "check_stock" in response:
         keyword = response.split(":", 1)[-1].strip()
-        if keyword:
-            await update.message.reply_text(f"🔎 Searching inventory for '{keyword}'...")
-            items = ac_service.check_stock(keyword)
-            if items:
-                msg = f"📦 **Stock Results for '{keyword}'**\n"
-                for i in items:
-                    msg += f"🔹 `{i['code']}`: {i['desc']}\n   👉 **{i['qty']} {i['uom']}**\n"
-                await update.message.reply_text(msg, parse_mode='Markdown')
-            else:
-                await update.message.reply_text(f"❌ No items found.")
+        items = ac_service.check_stock(keyword)
+        if items:
+            msg = ""
+            for i in items:
+                msg += f"📦 {i['desc']}: **{i['qty']}**\n"
+            await update.message.reply_text(msg, parse_mode='Markdown')
         else:
-            await update.message.reply_text("📦 What item?")
-
+            await update.message.reply_text("❌ Item not found")
+            
     else:
-        await update.message.reply_text("🤖 I'm listening.")
+        await update.message.reply_text("🤖 I am ready.")
 
 if __name__ == '__main__':
     TELEGRAM_TOKEN = "8274589592:AAHJgltCVJ_s4VwQoLRpFvsNJJc-M0ycs6k"
